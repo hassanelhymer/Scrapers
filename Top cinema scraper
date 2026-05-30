@@ -1,0 +1,208 @@
+import asyncio
+from playwright.async_api import async_playwright
+from urllib.parse import urljoin
+import json
+import random
+import os
+
+database = {}
+OUTPUT_FILE = "Movies database.json"
+PROGRESS_FILE = "progress.txt" # Tiny file to remember our spot
+CONCURRENT_LIMIT = 6  # Optimized speed for residential IPs
+PAGES_PER_RUN = 20    # How many pages you want to crunch in this sitting
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+]
+
+def load_previous_session():
+    """Reads the JSON and text files so we never lose progress or overwrite old items."""
+    global database
+    # Load data database
+    if os.path.exists(OUTPUT_FILE):
+        try:
+            with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+                database = json.load(f)
+            print(f"Loaded {len(database)} existing shows from database.")
+        except Exception:
+            print("Database file was empty or corrupted. Starting fresh dictionary.")
+            database = {}
+    
+    # Load page tracker index
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+                return int(f.read().strip())
+        except Exception:
+            return 1
+    return 1
+
+def save_progress_state(page_idx):
+    """Writes the current progress page checkpoint to a local tracking text file."""
+    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+        f.write(str(page_idx))
+
+async def scrape_single_episode(context, episode_link, semaphore):
+    if not episode_link:
+        return None
+        
+    async with semaphore:
+        await asyncio.sleep(random.uniform(0.2, 0.8))
+        watch_url = episode_link if episode_link.endswith("/") else f"{episode_link}/"
+        watch_url = urljoin(watch_url, "watch")
+        
+        page = await context.new_page()
+        try:
+            # Block media/styles to save RAM and massive bandwidth
+            await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,css,woff,woff2}", lambda route: route.abort())
+            
+            await page.goto(watch_url, timeout=20000)
+            await page.wait_for_selector("div.player--iframe", timeout=10000)
+            
+            iframe_src = await page.locator("div.player--iframe > iframe").get_attribute("src")
+            return {"link": episode_link, "embed_links": iframe_src}
+        except Exception:
+            return {"link": episode_link, "embed_links": None}
+        finally:
+            await page.close()
+
+async def run():
+    global database
+    
+    # Initialize state awareness before turning on the browser engine
+    start_page = load_previous_session()
+    max_pages_target = start_page + PAGES_PER_RUN - 1
+    current_page_idx = start_page
+    
+    if start_page > 139:
+        print(f"All 139 pages are already scraped! Check your {OUTPUT_FILE} file.")
+        return
+
+    async with async_playwright() as p:
+        print(f"Playwright Sync Speed Engine Initiated at Page {start_page}")
+        browser = await p.chromium.launch(
+            headless=True,  # Keeps it in the background so you can use your RAM for surfing
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+        )
+        
+        context_config = {
+            "user_agent": random.choice(USER_AGENTS),
+            "viewport": {"width": 1280, "height": 720}, # Compact window saves memory
+            "locale": "fr-MA",
+            "timezone_id": "Africa/Casablanca"
+        }
+        context = await browser.new_context(**context_config)
+        page = await context.new_page()
+        await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,css}", lambda route: route.abort())
+        
+        consecutive_failures = 0  
+        
+        while current_page_idx <= max_pages_target and current_page_idx <= 139:
+            if current_page_idx == 1:
+                current_page_url = "https://topcinemaa.com/top-rating-imdb-series/"
+            else:
+                current_page_url = f"https://topcinemaa.com/top-rating-imdb-series/page/{current_page_idx}/"
+                
+            print(f"\n--> Executing Page {current_page_idx}/{max_pages_target} (Global Limit: 139) -> {current_page_url}")
+            
+            try:
+                await page.goto(current_page_url, timeout=20000)
+                await page.wait_for_selector("div.Small--Box", timeout=10000)
+                consecutive_failures = 0
+            except Exception as e:
+                print(f"Skipping index page {current_page_idx} due to load failure.")
+                consecutive_failures += 1
+                if consecutive_failures > 3:
+                    print("Emergency exit to avoid ban chains.")
+                    break
+                current_page_idx += 1
+                continue
+            
+            series_elements = await page.locator("div.Small--Box > a").all()
+            series_to_process = []
+            
+            for element in series_elements:
+                name = (await element.locator("h3.title").inner_text()).strip()
+                link = await element.get_attribute("href")
+                seasons_number = (await element.locator("div.number.Collection").inner_text()).strip()
+                imdb_rating = (await element.locator("li.imdbRating").inner_text()).strip()
+                
+                series_to_process.append({
+                    "name": name,
+                    "link": link,
+                    "seasons_number": seasons_number,
+                    "imdb_rating": f"{imdb_rating}/10"
+                })
+            
+            for item in series_to_process:
+                # Deduplication: skip processing if the show was already saved in a previous day's run
+                if item['name'] in database:
+                    print(f"Skipping {item['name']} (Already matches an entry in our JSON database)")
+                    continue
+                    
+                print(f"Processing Series: {item['name']}")
+                try:
+                    await page.goto(item['link'], timeout=20000)
+                    await page.wait_for_selector("div.Small--Box.Season", timeout=10000)
+                except Exception:
+                    continue
+                
+                tag = (await page.locator("div.MediaQueryRight > ul.RightTaxContent > li:nth-child(1) > a").inner_text()).strip()
+                current_series_seasons = {}
+                seasons_elements = await page.locator("div.Small--Box.Season > a").all()
+                
+                for season_element in seasons_elements:
+                    season_span = (await season_element.locator("div.epnum").inner_text()).strip()
+                    season_link = await season_element.get_attribute("href")
+                    
+                    try:
+                        season_page = await context.new_page()
+                        await season_page.route("**/*.{png,jpg,jpeg,gif,webp,svg,css}", lambda route: route.abort())
+                        await season_page.goto(season_link, timeout=20000)
+                        await season_page.wait_for_selector("section.tabContents", timeout=10000)
+                        
+                        episode_elements = await season_page.locator("section.tabContents > section > div > a").all()
+                        episode_links = [await loc.get_attribute("href") for loc in episode_elements]
+                        await season_page.close()
+                    except Exception:
+                        await season_page.close()
+                        continue
+                    
+                    semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
+                    tasks = [scrape_single_episode(context, link, semaphore) for link in episode_links]
+                    current_season_episodes = await asyncio.gather(*tasks)
+                    current_season_episodes = [ep for ep in current_season_episodes if ep is not None]
+                    
+                    current_series_seasons[season_span] = {
+                        "url": season_link,
+                        "episodes": current_season_episodes
+                    }
+                    await asyncio.sleep(random.uniform(0.3, 1.0))
+                
+                database[item['name']] = {
+                    "url": item['link'],
+                    "tag": tag,
+                    "infos": {
+                        "title": item['name'],
+                        "Number of seasons": item['seasons_number'],
+                        "imdb_rating": item['imdb_rating'],
+                        "seasons": current_series_seasons
+                    }
+                }
+                save_json()
+                await asyncio.sleep(random.uniform(1.0, 2.5))
+            
+            # Page successfully scraped: Save tracking milestone to disk
+            current_page_idx += 1
+            save_progress_state(current_page_idx)
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+                
+        await browser.close()
+        print(f"\n Session complete. Progress pointer saved at Page: {current_page_idx}. See you tomorrow!")
+
+def save_json():
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(database, f, indent=4, ensure_ascii=False)
+
+asyncio.run(run())
